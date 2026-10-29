@@ -10,6 +10,8 @@ class BinderContainer(val binder: IBinder) : Parcelable {
         requireNotNull(parcel.readStrongBinder()) { "readStrongBinder() returned null" }
     )
 
+    fun getBinder(): IBinder = binder
+
     override fun writeToParcel(parcel: Parcel, flags: Int) {
         parcel.writeStrongBinder(binder)
     }

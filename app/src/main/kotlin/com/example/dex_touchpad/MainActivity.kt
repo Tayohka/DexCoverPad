@@ -37,29 +37,20 @@ class MainActivity : AppCompatActivity() {
 
     private var touchpadService: TouchpadService? = null
     private var mouseControl: IMouseControl? = null
-    private var crashPrefix: String? = null
     private var isUserServiceBound = false
     private var isBroadcastRegistered = false
 
     // Shizuku UserService — runs as shell UID, starts the native process
     private val userServiceArgs = UserServiceArgs(
         ComponentName(BuildConfig.APPLICATION_ID, ShizukuUserService::class.java.name)
-    ).daemon(false).processNameSuffix("user_service").debuggable(false).version(2)
+    ).daemon(false).processNameSuffix("user_service").debuggable(false).version(1)
 
-    // Connection for the Shizuku user service. The binder delivered here IS
-    // the IMouseControl binder — ShizukuUserService implements it directly
-    // on top of the native UHid library in its own process.
+    // Connection for the Shizuku user service (just used to start the native process)
     private val userServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            Log.d(TAG, "Shizuku UserService connected")
-            if (service == null) {
-                updateStatus("Error: user service binder was null")
-                return
-            }
-            mouseControl = IMouseControl.Stub.asInterface(service)
-            touchpadService?.setMouseControl(mouseControl)
-            binding.touchpadView.mouseControlService = mouseControl
-            updateStatus("Connected — touchpad active")
+            Log.d(TAG, "Shizuku UserService connected — native process should be starting")
+            updateStatus("Starting native service...")
+            // The native process will send us a binder via broadcast once ready
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -82,7 +73,7 @@ class MainActivity : AppCompatActivity() {
                             @Suppress("DEPRECATION")
                             intent.getParcelableExtra("binder")
                         }
-                        container?.binder
+                        container?.getBinder()
                     }.getOrNull() ?: intent.extras?.getBinder("binder")
 
                     if (rawBinder != null) {
@@ -157,14 +148,6 @@ class MainActivity : AppCompatActivity() {
             touchpadServiceConnection,
             Context.BIND_AUTO_CREATE
         )
-
-        DexApp.readCrashLog(application)?.let { log ->
-            val first = log.lineSequence()
-                .firstOrNull { it.contains("Exception") || it.contains("Error") }
-                ?.trim()?.take(140)
-            crashPrefix = "⚠ Last crash: ${first ?: "unknown (see logcat DexCrash)"}"
-            Log.e("DexCrash", "Crash log from previous run:\n$log")
-        }
 
         updateStatus("Waiting for Shizuku...")
     }
@@ -310,7 +293,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateStatus(status: String) {
         runOnUiThread {
-            binding.statusText.text = crashPrefix?.let { "$it\n$status" } ?: status
+            binding.statusText.text = status
         }
     }
 }

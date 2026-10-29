@@ -3,118 +3,73 @@ package com.example.dex_touchpad.services
 import android.os.Process
 import android.util.Log
 import com.example.dex_touchpad.IMouseControl
-import kotlin.math.roundToInt
+import java.io.File
 
 private const val TAG = "ShizukuUserService"
 
-// Linux input event codes the UI sends (include/uapi/linux/input-event-codes.h)
-private const val BTN_LEFT = 272
-private const val BTN_RIGHT = 273
-private const val BTN_MIDDLE = 274
-
 /**
- * Shizuku UserService — instantiated by Shizuku in a separate process
- * running as shell UID (2000).
+ * Shizuku UserService — this class is instantiated by Shizuku in a
+ * separate process running as shell UID (2000).
  *
- * This service IS the mouse: it loads libdextouchpad.so in-process and
- * implements IMouseControl directly on top of the native UHid functions.
- * The binder Shizuku hands to MainActivity in onServiceConnected is this
- * service's own binder — no native subprocess and no broadcast handshake.
+ * Its job is to:
+ *   1. Grant WRITE_SECURE_SETTINGS to the main app
+ *   2. Find and copy libdextouchpad.so to /data/local/tmp
+ *   3. Execute libdextouchpad.so as a native process
  *
- * (The original code instead copied the .so to /data/local/tmp and tried
- * to execute it as a standalone program, then waited for it to broadcast
- * a binder back. A JNI library has no entry point and no binder code, so
- * that could never work — the app hung at "Starting native service..."
- * forever.)
+ * The native process (libdextouchpad.so) then sends its IMouseControl
+ * binder back to the main app via a system broadcast.
  *
  * This class must NOT extend android.app.Service because Shizuku
- * manages its lifecycle via IPC — it just implements IMouseControl.Stub.
+ * manages its lifecycle via IPC — it just needs to implement IMouseControl.Stub.
  */
 class ShizukuUserService : IMouseControl.Stub() {
 
-    private val nativeLock = Any()
-
-    @Volatile
-    private var deviceReady = false
-
     init {
         Log.d(TAG, "ShizukuUserService created, UID=${Process.myUid()}")
-        try {
-            exec("pm grant com.example.dex_touchpad android.permission.WRITE_SECURE_SETTINGS")
-        } catch (e: Exception) {
-            Log.w(TAG, "pm grant failed", e)
-        }
-        ensureDevice()
+        startNativeService()
     }
 
-    private fun ensureDevice(): Boolean {
-        if (deviceReady) return true
-        synchronized(nativeLock) {
-            if (deviceReady) return true
-            MouseNative.load()
-            if (!MouseNative.isLoaded) return false
-            deviceReady = runCatching { MouseNative.nativeCreateUHid() }
-                .onFailure { Log.e(TAG, "nativeCreateUHid threw", it) }
-                .getOrDefault(false)
-            Log.d(TAG, "UHid device ready: $deviceReady")
-            return deviceReady
-        }
-    }
-
-    override fun moveCursor(deltaX: Float, deltaY: Float) {
-        if (!ensureDevice()) return
-        synchronized(nativeLock) {
-            // The native side clamps each axis to ±127 per event; chunk
-            // larger deltas so fast flicks aren't truncated.
-            var x = deltaX.roundToInt()
-            var y = deltaY.roundToInt()
-            while (x != 0 || y != 0) {
-                val sx = x.coerceIn(-127, 127)
-                val sy = y.coerceIn(-127, 127)
-                MouseNative.nativeUHidEvent(sx, sy)
-                x -= sx
-                y -= sy
-            }
-        }
-    }
-
-    override fun sendClick(buttonCode: Int) {
-        if (!ensureDevice()) return
-        synchronized(nativeLock) {
-            when (buttonCode) {
-                BTN_LEFT -> click { MouseNative.nativeUHidPressL(it) }
-                BTN_RIGHT -> click { MouseNative.nativeUHidPressR(it) }
-                BTN_MIDDLE -> click { MouseNative.nativeUHidPressM(it) }
-                else -> Log.w(TAG, "Unknown button code $buttonCode")
-            }
-        }
-    }
-
-    private fun click(press: (Boolean) -> Unit) {
-        press(true)
-        // Give the input stack a beat to register the press before release;
-        // a same-instant down/up can be coalesced and lost.
-        Thread.sleep(30)
-        press(false)
-    }
-
-    override fun sendScroll(verticalDelta: Float, horizontalDelta: Float) {
-        if (!ensureDevice()) return
-        // The virtual mouse has a single wheel axis; horizontal is ignored.
-        val v = verticalDelta.roundToInt()
-        if (v == 0) return
-        synchronized(nativeLock) {
-            MouseNative.nativeUHidScroll(v)
-        }
-    }
-
+    override fun moveCursor(deltaX: Float, deltaY: Float) {}
+    override fun sendClick(buttonCode: Int) {}
+    override fun sendScroll(verticalDelta: Float, horizontalDelta: Float) {}
     override fun destroy() {
         Log.d(TAG, "destroy() called")
-        synchronized(nativeLock) {
-            if (deviceReady) {
-                runCatching { MouseNative.nativeCloseUHid() }
-                deviceReady = false
+        stopNativeService()
+    }
+
+    private fun startNativeService() {
+        try {
+            Log.d(TAG, "UID=${Process.myUid()} — granting permissions and starting native service")
+
+            exec("pm grant com.example.dex_touchpad android.permission.WRITE_SECURE_SETTINGS")
+
+            val libPath = findNativeLib()
+            if (libPath == null) {
+                Log.e(TAG, "libdextouchpad.so not found")
+                return
             }
+
+            exec("pkill -f libdextouchpad 2>/dev/null; true")
+            Thread.sleep(300)
+
+            val targetPath = "/data/local/tmp/libdextouchpad.so"
+            exec("cp -f '$libPath' '$targetPath' && chmod +x '$targetPath'")
+
+            val pb = ProcessBuilder("sh", "-c", "nohup '$targetPath' >/dev/null 2>&1 &")
+            pb.redirectErrorStream(true)
+            val proc = pb.start()
+            proc.inputStream.close()
+            Log.d(TAG, "Native UHid service started from $libPath")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start native service", e)
+        }
+    }
+
+    private fun stopNativeService() {
+        try {
+            exec("pkill -f libdextouchpad 2>/dev/null; true")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping native service", e)
         }
     }
 
@@ -127,5 +82,25 @@ class ShizukuUserService : IMouseControl.Stub() {
         } catch (e: Exception) {
             Log.w(TAG, "exec failed: $command", e)
         }
+    }
+
+    private fun findNativeLib(): String? {
+        try {
+            val process = Runtime.getRuntime().exec(arrayOf(
+                "sh", "-c",
+                "find /data/app -name 'libdextouchpad.so' 2>/dev/null | head -1"
+            ))
+            val result = process.inputStream.bufferedReader().readLine()?.trim()
+            process.waitFor()
+            if (!result.isNullOrEmpty() && File(result).exists()) {
+                Log.d(TAG, "Found native lib at: $result")
+                return result
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "find command failed", e)
+        }
+        val tmpPath = "/data/local/tmp/libdextouchpad.so"
+        if (File(tmpPath).exists()) return tmpPath
+        return null
     }
 }
